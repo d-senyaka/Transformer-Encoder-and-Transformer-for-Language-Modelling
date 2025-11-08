@@ -22,25 +22,52 @@ def get_batch():
     return xb, yb, len(idx)
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model=D_MODEL, max_len=SEQ_LEN, learned=False):
+    """
+    Adds position info to token embeddings.
+    - learned=False → sinusoidal (no trainable params, stable & deterministic)
+    - learned=True  → learned table (trainable)
+    Works with variable L <= max_len (default 20).
+    """
+    def __init__(self, d_model=64, max_len=20, learned=False):
         super().__init__()
+        self.max_len = max_len
+        self.d_model = d_model
+        self.learned = learned
+
         if learned:
-            self.pe = nn.Parameter(torch.randn(1, max_len, d_model))
-            self.is_learned = True
+            self.pe = nn.Embedding(max_len, d_model)
+            # init small to avoid swamping token embeddings at start
+            nn.init.normal_(self.pe.weight, mean=0.0, std=0.02)
         else:
+            # Build fixed sinusoidal table [1, max_len, d_model]
             pe = torch.zeros(max_len, d_model)
-            position = torch.arange(0, max_len).unsqueeze(1)
-            div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+            position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)  # [L,1]
+            div_term = torch.exp(
+                torch.arange(0, d_model, 2, dtype=torch.float32) *
+                (-math.log(10000.0) / d_model)
+            )
             pe[:, 0::2] = torch.sin(position * div_term)
             pe[:, 1::2] = torch.cos(position * div_term)
-            self.register_buffer("pe", pe.unsqueeze(0))
-            self.is_learned = False
+            self.register_buffer("pe_table", pe.unsqueeze(0), persistent=False)  # [1,L,d]
 
     def forward(self, x):
-        # x: [B, 20, d_model]
-        if self.is_learned:
-            return x + self.pe[:, :x.size(1)]
-        return x + self.pe[:, :x.size(1)]
+        """
+        x: [B, L, d_model]
+        returns: x + PE (broadcast-safe)
+        """
+        B, L, D = x.shape
+        assert D == self.d_model, f"d_model mismatch: got {D}, expected {self.d_model}"
+        assert L <= self.max_len, f"seq len {L} exceeds max_len {self.max_len}"
+
+        if self.learned:
+            positions = torch.arange(0, L, device=x.device)  # [L]
+            pe = self.pe(positions).unsqueeze(0)             # [1,L,d]
+        else:
+            pe = self.pe_table[:, :L, :]                     # [1,L,d]
+            # ensure same dtype/device as x
+            pe = pe.to(dtype=x.dtype, device=x.device)
+
+        return x + pe
 
 class TransformerLayer(nn.Module):
     def __init__(self, d_model=D_MODEL, d_internal=D_INTERNAL):
@@ -87,8 +114,81 @@ def _quick_forward_test():
     print("Row sums (should be ~1):", row_sums)
     print("✅ MiniTransformer forward OK:", y.shape, A.shape)
 
+def _pe_unit_tests():
+    B, L, D = 4, 20, 64
+    x = torch.zeros(B, L, D)
+
+    # Sinusoidal: no trainable params, identical across batches, deterministic
+    pe_sin = PositionalEncoding(d_model=D, max_len=L, learned=False)
+    y = pe_sin(x)
+    assert y.shape == (B, L, D)
+    # positions must differ
+    assert not torch.allclose(y[:, 0, :], y[:, 1, :]), "Position 0 and 1 encs should differ"
+    # not all zeros
+    assert y.abs().sum() > 0, "PE should add non-zero signal"
+    # params check
+    assert sum(p.numel() for p in pe_sin.parameters()) == 0, "Sinusoidal PE should have no params"
+
+    # Learned: trainable params, gradients flow
+    pe_learn = PositionalEncoding(d_model=D, max_len=L, learned=True)
+    y2 = pe_learn(x.requires_grad_(True))
+    assert y2.shape == (B, L, D)
+    loss = y2.sum()
+    loss.backward()
+    # at least some grad in the embedding weights
+    grad_sum = pe_learn.pe.weight.grad.abs().sum().item()
+    assert grad_sum > 0, "Learned PE weights should receive gradient"
+
+    print("✅ PositionalEncoding tests passed (sinusoidal + learned)")
+
+def _mini_transformer_with_pe_test(learned=False):
+    from updated_member1_data_pipeline import build_vocab_indexer, build_dataloader
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class TransformerLayer(nn.Module):
+        def __init__(self, d_model=64, d_internal=64):
+            super().__init__()
+            self.Wq = nn.Linear(d_model, d_internal)
+            self.Wk = nn.Linear(d_model, d_internal)
+            self.Wv = nn.Linear(d_model, d_model)
+            self.ff = nn.Sequential(
+                nn.Linear(d_model, 4*d_model), nn.ReLU(), nn.Linear(4*d_model, d_model)
+            )
+        def forward(self, x):
+            Q, K, V = self.Wq(x), self.Wk(x), self.Wv(x)
+            scores = Q @ K.transpose(-2, -1) / (K.size(-1)**0.5)
+            A = F.softmax(scores, dim=-1)         # [B,20,20]
+            context = A @ V                        # [B,20,d]
+            y = x + context
+            y = y + self.ff(y)
+            return y, A
+
+    class MiniTransformer(nn.Module):
+        def __init__(self, vocab_size=27, d_model=64, learned_pe=False):
+            super().__init__()
+            self.emb = nn.Embedding(vocab_size, d_model)
+            self.pe = PositionalEncoding(d_model=d_model, max_len=20, learned=learned_pe)
+            self.layer = TransformerLayer(d_model=d_model, d_internal=64)
+        def forward(self, x_idx):
+            h = self.emb(x_idx)
+            h = self.pe(h)
+            h, A = self.layer(h)
+            return h, A
+
+    v, idx = build_vocab_indexer()
+    loader = build_dataloader("data/lettercounting-train.txt", idx, batch_size=8)
+    xb, _ = next(iter(loader))
+    model = MiniTransformer(vocab_size=len(idx), d_model=64, learned_pe=learned)
+    y, A = model(xb)
+    assert y.shape == (xb.size(0), 20, 64)
+    assert A.shape == (xb.size(0), 20, 20)
+    print(f"✅ MiniTransformer(+PE learned={learned}) OK:", y.shape, A.shape)
 
 if __name__ == "__main__":
     xb, yb, vocab_size = get_batch()
     print("Vocab size:", vocab_size)  # expect 27
     _quick_forward_test()
+    _pe_unit_tests()
+    _mini_transformer_with_pe_test(learned=False)
+    _mini_transformer_with_pe_test(learned=True)
