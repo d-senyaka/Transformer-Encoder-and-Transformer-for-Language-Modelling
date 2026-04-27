@@ -9,7 +9,7 @@ A Python (PyTorch) implementation of core Transformer building blocks, applied t
 
 ---
 
-## Highlights (What’s implemented here)
+## Highlights
 
 ### ✅ Part A — Transformer for **Letter Counting** (Sequence Labeling)
 This repository includes a working Transformer-based classifier for the classic **letter-counting** task:
@@ -168,5 +168,3 @@ This repository contains both:
 
 ---
 
-## License
-No license file detected in the repository. 
