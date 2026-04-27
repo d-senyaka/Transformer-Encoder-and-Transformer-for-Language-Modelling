@@ -169,4 +169,4 @@ This repository contains both:
 ---
 
 ## License
-No license file detected in the repository. If you plan to reuse or publish this work, consider adding a license (e.g., MIT, Apache-2.0).
+No license file detected in the repository. 
